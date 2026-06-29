@@ -1,0 +1,552 @@
+
+Let’s shift to a developer's blueprint. I’ll outline the architecture, tech stack, project structure, workflow pipelines, and resource plan to build this as a scalable, maintainable system.
+1. System Architecture (High-Level)
+text
+[OSINT Sources] → [n8n Ingestion Workflow] → [AI Classification Service] → [API/Backend]
+                        ↓                          ↓
+                  [Guardrails & Pre-
+processing]  [
+PostgreSQL + 
+PostGIS
+ + 
+pgvector
+]
+                        ↓
+                  [Analyst Review Queue] ← [Linkage Engine (n8n 
+cron
+)]
+                        ↓
+                  [Dashboard (React + 
+MapLibre
+/
+OpenLayers
+)]
+The system is event-driven but n8n acts as the orchestrator. The core is a PostgreSQL database with spatial and vector extensions, enabling both geospatial queries and semantic similarity for linkage.
+2. Technology Stack
+Orchestration & Workflow Engine
+n8n (self-hosted) – Community edition (fair-code) for all ingestion, enrichment, and automated linkage workflows. Run in Docker/Kubernetes.
+AI / NLP
+Classification Model: Fine-tuned open-source LLM (e.g., Llama 3.1 8B, Mistral 7B, or 
+Mixtral
+) served via 
+vLLM
+ or 
+Ollama
+ with function calling for structured JSON output.
+Translation: 
+DeepL
+ API or 
+LibreTranslate
+ (self-hosted) for low-resource languages.
+PII Redaction: Presidio (Microsoft) or a custom 
+spaCy
+ pipeline for sanitization.
+Embeddings: text-embedding-3-small (OpenAI) or a local model like all-MiniLM-L6-v2 via sentence-transformers, stored in 
+pgvector
+.
+Database
+PostgreSQL 16 + 
+PostGIS
+ (geometry, geography) + 
+pgvector
+ (vector similarity). A single database handles events, sources, actors, links, and embeddings.
+Backend API (for Dashboard and Data Access)
+Python/
+FastAPI
+ or Node.js/Express – exposes REST/WebSocket endpoints for the frontend. Authentication via 
+Keycloak
+ or Auth0.
+Redis – caching and pub/sub for real-time updates (new events pushed via 
+WebSockets
+).
+Frontend Dashboard
+React (or Next.js) with 
+MapLibre
+ GL JS (open-source fork of 
+Mapbox
+ GL) or 
+OpenLayers
+.
+Chart libraries: Recharts or D3.js for timelines, network graphs (vis.js or react-force-graph for event linkage visualization).
+State management: 
+Zustand
+ or Redux Toolkit.
+DevOps & Infrastructure
+Containerization: Docker, Kubernetes (optional, can start with Docker Compose).
+Message Queue: Redis pub/sub or RabbitMQ for event-driven updates.
+Logging & Monitoring: Prometheus + Grafana, ELK stack for n8n logs.
+CI/CD: GitHub Actions or GitLab CI.
+3. Project Folder Structure (
+Monorepo
+ Example)
+text
+osint
+-analyst-platform/
+├── n8n/
+│   ├── workflows/               # Exported JSON workflows
+│   ├── custom-nodes/            # If extending n8n
+│   └── docker-compose.n8n.yml
+├── backend/
+│   ├── 
+api
+/                     # 
+FastAPI
+ application
+│   │   ├── routers/             # events, actors, links, dashboard
+│   │   ├── models/              # 
+SQLAlchemy
+/
+Pydantic
+ models
+│   │   ├── services/            # business logic, link analysis
+│   │   └── 
+db
+/                  # migrations (Alembic)
+│   ├── ai-service/              # Separate microservice for AI (if not using n8n nodes)
+│   │   ├── 
+model_server
+/        # 
+vLLM
+/
+Ollama
+ 
+Dockerfile
+│   │   └── 
+classification_api
+/  #
+ thin API wrapping model
+│   └── docker-
+compose.yml
+├── frontend/
+│   ├── 
+src
+/
+│   │   ├── components/          # Map, 
+EventCard
+, 
+LinkGraph
+, Timeline
+│   │   ├── pages/               # Dashboard, Analyst Queue, Settings
+│   │   ├── store/               # state slices
+│   │   └── 
+api
+/                 # 
+axios
+/fetch helpers
+│   └── 
+Dockerfile
+├── infrastructure/
+│   ├── 
+db
+/
+init
+/                 # SQL scripts for 
+PostGIS
+ + 
+pgvector
+│   └── monitoring/
+├── docs/
+└── README.md
+4. n8n Workflow Pipelines (The Core Orchestration)
+We define several n8n workflows, some triggered by webhooks/
+cron
+, others sub-workflows.
+4.1 OSINT Ingestion Workflow
+Trigger: Cron (every 5 min), webhooks, RSS poll, Telegram bot listener.Steps:
+Fetch/Receive raw post from source (HTTP Request, Telegram Trigger, etc.).
+Deduplication: Compute hash (MD5) of 
+source_url
+ + text. Check against Redis cache or DB. If duplicate, stop.
+Sanitization Node: Call Presidio API to redact PII (optional). Use regex to strip control chars.
+Source Credibility: Look up source domain/handle in a Config node (maintained table) and attach 
+source_rating
+ (A-F) and 
+source_tier
+.
+Language Detect & Translate: n8n HTTP node to 
+LibreTranslate
+ API; store both original and English text.
+Geoparse
+: Use a self-hosted 
+spaCy
+ API or a geoparsing node that extracts locations and coordinates (via 
+Nominatim
+/
+Geonames
+). If no coordinates found, fallback to country centroid based on mention.
+Embedding Generation: Send 
+clean_english_text
+ to an embedding service, receive vector.
+Store OSINT Observation: Insert into 
+osint_sources
+ table via Postgres node.
+Enqueue for Classification: Publish message to Redis channel 
+pending_classification
+ with 
+post_id
+.
+4.2 AI Classification Workflow
+Trigger: Redis pub/sub listener or an n8n polling node that checks a pending status column.Steps:
+Fetch post by ID from DB.
+Call AI Model: HTTP request to the 
+vLLM
+/
+Ollama
+ server. The prompt includes the event taxonomy and requires structured JSON output.
+Validate JSON Schema: If invalid, retry or flag for human review.
+Extract Entities: From the JSON, get 
+event_class
+, actor, target, location, etc.
+Match/Resolve Actors: Query actors table via fuzzy match (or exact). If new actor, create a placeholder and flag.
+Insert Event: into events table with geometry from coordinates, AI confidence score, and FK to OSINT source.
+Auto-linkage Trigger: Call a webhook that runs a mini linkage check for the new event (next workflow).
+Update Status: Mark OSINT post as classified.
+4.3 Automated Linkage Workflow (Scheduled or On-Event)
+Trigger: On new event or nightly 
+cron
+.Steps:
+Spatial-temporal cluster: Query events within last 24h, using 
+ST_DWithin
+ and time difference < 12h, same country.
+Actor similarity: For each new event, find events in past 90 days where 
+actor_initiator_id
+ or 
+actor_target_id
+ matches exactly.
+Vector similarity: Use 
+pgvector
+ to find events with description embedding cosine similarity > 0.85, different from itself.
+Heuristic scoring: Combine spatial, temporal, actor, and semantic similarity into a 
+link_confidence
+ (0.0–1.0).
+Propose Links: Insert candidate links into 
+event_links
+ with 
+link_confidence
+ and status proposed; notify analyst queue if above threshold.
+Analyst review: An n8n workflow can email/Slack an analyst to confirm or reject.
+4.4 Guardrails & Compliance Workflows
+Sensitive Keyword Alert: If text contains specific weapon system codes or classified codewords (configurable list), route to a secure vault, not the main dashboard (requires separate handling).
+Quarantine: Low source rating (E-F) posts can be stored but not auto-linked; held for human analysis.
+5. Database Schema (Core Tables)
+sql
+CREATE EXTENSION 
+postgis
+;
+CREATE EXTENSION vector;
+-- Sources
+CREATE TABLE 
+osint_sources
+ (
+    id BIGSERIAL PRIMARY KEY,
+    
+raw_text
+ TEXT,
+    
+clean_text
+ TEXT,
+    
+translated_text
+ TEXT,
+    
+source_url
+ TEXT NOT NULL,
+    
+source_handle
+ TEXT,
+    
+source_rating
+ 
+CHAR(
+1), -- A-F
+    
+source_tier
+ 
+SMALLINT,  --
+ 1-4
+    
+posted_at
+ TIMESTAMPTZ,
+    
+ingested_at
+ TIMESTAMPTZ DEFAULT 
+NOW(
+),
+    
+content_hash
+ TEXT UNIQUE,
+    embedding 
+vector(
+384) -- or 1536
+);
+-- Actors (normalized)
+CREATE TABLE actors (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    aliases 
+TEXT[
+],
+    type TEXT, -- state, non-state, 
+military_unit
+, ...
+    country TEXT,
+    metadata JSONB
+);
+-- Events
+CREATE TABLE events (
+    id BIGSERIAL PRIMARY KEY,
+    
+osint_source_id
+ BIGINT REFERENCES 
+osint_sources
+(id),
+    
+event_class
+ TEXT NOT NULL, -- from taxonomy
+    
+event_subclass
+ TEXT,
+    description 
+TEXT,   
+       -- AI summary
+    
+geom
+ 
+GEOMETRY(
+Point, 4326),
+    country TEXT,
+    admin1 TEXT,
+    
+started_at
+ 
+TIMESTAMPTZ,   
+ -- inferred event time
+    
+ai_confidence
+ 
+TEXT,   
+     -- high/med/low
+    
+actor_initiator_id
+ INT REFERENCES actors(id),
+    
+actor_target_id
+ INT REFERENCES actors(id),
+    
+weapon_system
+ TEXT,
+    
+casualties_est
+ 
+JSONB,   
+   -- {min: 0, max: 10}
+    
+classification_version
+ INT DEFAULT 1,
+    
+created_at
+ TIMESTAMPTZ DEFAULT 
+NOW(
+),
+    status TEXT DEFAULT '
+pending_review
+' -- 
+pending_review
+, confirmed, discarded
+);
+CREATE INDEX 
+idx_events_geom
+ ON events USING GIST (
+geom
+);
+CREATE INDEX 
+idx_events_class
+ ON events (
+event_class
+, 
+started_at
+ DESC);
+CREATE INDEX 
+idx_events_actor_initiator
+ ON events (
+actor_initiator_id
+);
+-- Event Links (the intelligence graph)
+CREATE TABLE 
+event_links
+ (
+    id BIGSERIAL PRIMARY KEY,
+    event_id_1 BIGINT REFERENCES events(id) ON DELETE CASCADE,
+    event_id_2 BIGINT REFERENCES events(id) ON DELETE CASCADE,
+    
+relationship_type
+ TEXT, -- causal, sequential, 
+part_of_operation
+, 
+similar_mo
+, 
+same_actor_group
+    
+link_confidence
+ REAL DEFAULT 0.0,
+    
+created_by
+ 
+TEXT,   
+     -- 'system' or 
+analyst_user_id
+    status TEXT DEFAULT 'proposed', -- proposed, confirmed, rejected
+    notes TEXT,
+    
+created_at
+ TIMESTAMPTZ DEFAULT 
+NOW(
+),
+    CHECK (event_id_1 < event_id_2) -- prevent duplicates
+);
+Additional tables: campaigns, 
+analyst_actions
+, 
+audit_log
+.
+6. API Layer (
+FastAPI
+ Skeleton)
+Endpoints needed for the dashboard:
+GET /events – paginated list with filters (class, country, date range, actor, confidence). Returns 
+GeoJSON
+ 
+FeatureCollection
+.
+GET /events/:id – single event with all linked OSINT, actors, proposed links.
+POST /events/:id/links – analyst creates/confirms a link.
+GET /events/network – returns graph data (nodes and edges) for linkage visualization (
+event_ids
+, relationship).
+GET /stats – aggregated counts, timeline data for charts.
+POST /analyst/review – approve/discard/classify event.
+WebSocket /
+ws
+/events – pushes new confirmed events in real-time (via Redis pub/sub).
+The AI classification service can be exposed as a microservice with a single endpoint /classify that takes text and returns structured JSON, so n8n can call it directly.
+7. Frontend Dashboard Components
+Map View: Uses 
+MapLibre
+ GL JS with custom vector tiles (or just 
+GeoJSON
+ layers from API). Layers: event clusters, heatmap, filtered by class (icons for military, political, etc.). Clicking an event opens a sidebar.
+Timeline & Analytics: A timeline chart showing event counts over time, filterable by region. A table view with sorting.
+Network Graph Panel: When an event is selected, show its links as a force-directed graph (react-force-graph). Allows analysts to drag, explore, and click to navigate.
+Analyst Workbench: A queue of pending events (low confidence, proposed links). A form to edit classification, confirm actors, create links manually.
+Watchlist & Alerts: Users can set geographic/country/actor watchlists and receive in-app notifications.
+Authentication via JWT; role-based access (viewer, analyst, admin).
+8. DevOps and Deployment
+Local Development: Docker Compose with containers for n8n, 
+postgres
+ (with extensions), 
+pgvector
+, Redis, 
+Ollama
+ (or a CPU-only LLM), 
+FastAPI
+, and React dev server.
+Production: Kubernetes cluster with persistent volumes for DB, using managed PostgreSQL (e.g., Cloud SQL for 
+PostGIS
+ support) if possible. The AI inference may require GPU nodes (cost). Alternatively, use cloud-hosted LLM APIs (OpenAI, Together AI) for the classification step if self-hosting is infeasible; but that adds data sensitivity concerns.
+Environment Variables: Centralized in Kubernetes Secrets or .env files for API keys (Telegram, X, translation).
+Backup: DB backups daily, stored encrypted. n8n workflows exported to Git.
+9. Resource and Tool Overview (Cost-Optimized)
+Component
+Self-Hosted Tool
+Cloud Alternative
+Notes
+Workflow Engine
+n8n (Docker)
+n8n.cloud
+Self-hosted community ed. is free, powerful
+Database
+PostgreSQL + 
+PostGIS
+ + 
+pgvector
+AWS RDS + 
+pgvector
+, 
+Supabase
+Supabase
+ supports both extensions, free tier up to 500MB
+AI Model Serving
+Ollama
+ + Llama 3.1 8B (CPU/GPU)
+Together AI / 
+Groq
+ API
+For high-volume, a small GPU (T4) is enough for 8B
+Translation
+LibreTranslate
+ (Docker)
+DeepL
+ API
+LibreTranslate
+ is free but slower for many languages
+Embeddings
+sentence-transformers (Python)
+OpenAI embeddings
+Local all-MiniLM-L6-v2 is lightweight (384d)
+Geocoding
+Nominatim
+ (OpenStreetMap) self-hosted
+Mapbox
+ Geocoding / Google
+Nominatim
+ is free but rate-limited; self-host Docker image
+Frontend Map Tiles
+MapLibre
+ + OSM tiles
+Mapbox
+, 
+Maptiler
+Free OSM tiles work for moderate use; self-host tile server if needed
+Monitoring
+Prometheus + Grafana
+Grafana Cloud
+–
+Queue/ Pub/Sub
+Redis
+AWS 
+ElastiCache
+Redis is simple and sufficient
+Estimated minimum cloud footprint (if cloud-hosted):
+1 VM (4 vCPU, 16GB RAM) for n8n + backend + Redis + 
+Ollama
+ (CPU) – ~$50/month
+1 managed DB (PostgreSQL) with 
+PostGIS
+ – ~$20/month
+1 small VM for frontend (or use 
+Vercel
+/Netlify for free) – 0-5/month
+For better AI performance, a GPU instance (e.g., Lambda Labs, 
+RunPod
+) costing ~$0.60/
+hr
+ spot; could be on-demand via n8n, keeping total low.
+10. Development Roadmap (Phases)
+Phase 1 – MVP (2–3 months)
+Set up n8n, PostgreSQL, basic ingestion from 1-2 sources (e.g., RSS + Telegram).
+Simple classification using pre-trained LLM (no fine-tuning) with basic event taxonomy.
+Minimal dashboard: map with event points from DB.
+Manual event creation/editing by analysts.
+Phase 2 – Analyst Features (2 months)
+AI fine-tuning on military/geopolitical event data (using CAMEO or custom dataset).
+Entity (actor) extraction and actor table population.
+Automated linkage suggestions (spatial + actor).
+Analyst review queue, link confirmation UI, network graph.
+Phase 3 – Scale & Enrich (2 months)
+Advanced guardrails, PII redaction, disinformation filters.
+I&W pattern recognition (complex event processing).
+Multi-tenancy if needed.
+Mobile-friendly analyst notifications.
+This setup gives you a production-ready foundation that stays true to the intelligence analyst’s needs while being built with a modern, modular stack. 
+Next
+ I can elaborate on the exact n8n workflow JSON, the AI prompt template, or the frontend component tree—just let me know where you’d like to zoom in.

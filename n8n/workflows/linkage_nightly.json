@@ -1,0 +1,56 @@
+{
+  "id": "campaign-event-linking",
+  "name": "Campaign Event Linking",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "campaign_linking_schedule",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        120,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const baseUrl = ($env.BACKEND_API_URL || 'http://backend:8000').replace(/\\/$/, '');\nconst username = $env.CAMPAIGN_LINKER_USERNAME || 'analyst';\nconst password = $env.CAMPAIGN_LINKER_PASSWORD || 'analyst123';\n\nconst login = await this.helpers.httpRequest({\n  method: 'POST',\n  url: `${baseUrl}/auth/login`,\n  body: {\n    username,\n    password,\n    workspace: 'dashboard'\n  },\n  json: true\n});\n\nconst summary = await this.helpers.httpRequest({\n  method: 'POST',\n  url: `${baseUrl}/campaigns/link-events`,\n  headers: {\n    Authorization: `Bearer ${login.access_token}`\n  },\n  json: true\n});\n\nreturn [\n  {\n    json: {\n      ran_at: new Date().toISOString(),\n      workflow: 'Campaign Event Linking',\n      ...summary\n    }\n  }\n];"
+      },
+      "id": "execute_campaign_linking",
+      "name": "Execute Campaign Linking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        220
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Execute Campaign Linking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "versionId": "campaign-event-linking-v1"
+}

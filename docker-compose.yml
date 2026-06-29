@@ -1,0 +1,108 @@
+services:
+  db:
+    build:
+      context: .
+      dockerfile: infrastructure/db/Dockerfile
+    container_name: intel_db
+    environment:
+      POSTGRES_DB: intel
+      POSTGRES_USER: intel
+      POSTGRES_PASSWORD: intel
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infrastructure/db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U intel -d intel"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  redis:
+    image: redis:7-alpine
+    container_name: intel_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  backend:
+    build:
+      context: ./backend
+    container_name: intel_backend
+    environment:
+      APP_NAME: Intelligence Analyzer API
+      APP_ENV: local
+      DATABASE_URL: postgresql://intel:intel@db:5432/intel
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:5678,http://${LAN_HOST:-localhost}:3000,http://${LAN_HOST:-localhost}:5173}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-local-dev-change-me}
+      JWT_EXPIRES_MINUTES: ${JWT_EXPIRES_MINUTES:-480}
+      AUTH_USERS: ${AUTH_USERS:-admin:admin123:admin,analyst:analyst123:analyst,viewer:viewer123:viewer,portal:portal123:submitter}
+      N8N_INGEST_WEBHOOK_URL: ${N8N_INGEST_WEBHOOK_URL:-http://n8n:5678/webhook/int-ingestion}
+      MAXAR_API_KEY: ${MAXAR_API_KEY:-}
+      MAXAR_CATALOG_SEARCH_URL: ${MAXAR_CATALOG_SEARCH_URL:-https://api.maxar.com/discovery/v1/catalogs/imagery/search}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: intel_n8n
+    ports:
+      - "5678:5678"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      NODE_ENV: production
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: intel
+      DB_POSTGRESDB_USER: intel
+      DB_POSTGRESDB_PASSWORD: intel
+      N8N_SECURE_COOKIE: "false"
+      GENERIC_TIMEZONE: Africa/Nairobi
+      HUGGINGFACE_API_TOKEN: ${HUGGINGFACE_API_TOKEN:-}
+      HF_MODEL_URL: ${HF_MODEL_URL:-https://router.huggingface.co/hf-inference/models/katanemo/Arch-Router-1.5B}
+      HF_EMBEDDING_URL: ${HF_EMBEDDING_URL:-https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction}
+      CLASSIFIER_PROVIDER: ${CLASSIFIER_PROVIDER:-hf}
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/opt/workflows
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: intel_frontend
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://${LAN_HOST:-localhost}:8000}
+      VITE_MAXAR_API_KEY: ${VITE_MAXAR_API_KEY:-}
+      VITE_MAXAR_TILE_URL: ${VITE_MAXAR_TILE_URL:-}
+      VITE_MAXAR_WMS_URL: ${VITE_MAXAR_WMS_URL:-https://api.maxar.com/streaming/v1/ogc/wms}
+      VITE_MAXAR_WMS_LAYERS: ${VITE_MAXAR_WMS_LAYERS:-Maxar:Imagery}
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  pg_data:
+  n8n_data:

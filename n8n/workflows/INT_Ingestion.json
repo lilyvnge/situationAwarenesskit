@@ -1,0 +1,310 @@
+{
+  "name": "INT Ingestion",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "6cf9c2f0-c994-4aa4-bb8d-ec91271fb239",
+      "name": "Cron Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -32,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://news.google.com/rss/search?q=military+incursion",
+        "options": {}
+      },
+      "id": "13216aae-6f5c-432a-a605-1cae62e25ab2",
+      "name": "Fetch RSS",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        208,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const input = ($json.body && typeof $json.body === 'object' && !Array.isArray($json.body))\n  ? $json.body\n  : $json;\n\nconst text =\n  input.contentSnippet ||\n  input.content ||\n  input.title ||\n  input.raw_text ||\n  input.clean_text ||\n  '';\n\nconst sourceUrl =\n  input.link ||\n  input.source_url ||\n  `manual://${Date.now()}`;\n\nfunction stableHash(input) {\n  let h1 = 0xdeadbeef ^ input.length;\n  let h2 = 0x41c6ce57 ^ input.length;\n\n  for (let i = 0; i < input.length; i++) {\n    const ch = input.charCodeAt(i);\n    h1 = Math.imul(h1 ^ ch, 2654435761);\n    h2 = Math.imul(h2 ^ ch, 1597334677);\n  }\n\n  h1 =\n    Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^\n    Math.imul(h2 ^ (h2 >>> 13), 3266489909);\n\n  h2 =\n    Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^\n    Math.imul(h1 ^ (h1 >>> 13), 3266489909);\n\n  return ((4294967296 * (2097151 & h2)) + (h1 >>> 0)).toString(16);\n}\n\nconst hash = stableHash(`${sourceUrl}|${text}`);\n\nreturn {\n  title: input.title || null,\n  source_url: sourceUrl,\n  raw_text: text,\n  clean_text: text.replace(/\\s+/g, ' ').trim(),\n  source_rating: input.source_rating || 'B',\n  source_tier: Number(input.source_tier || 3),\n  posted_at: input.isoDate || input.posted_at || new Date().toISOString(),\n  content_hash: hash\n};"
+      },
+      "id": "41c5b9d7-cad9-4307-812b-624d73bc45e1",
+      "name": "Normalize Observation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const src = $('Normalize Observation').item.json;\nconst rawEmbedding = $json;\n\nfunction extractVector(payload) {\n  if (Array.isArray(payload)) {\n    if (payload.length === 0) return null;\n    if (Array.isArray(payload[0])) return payload[0];\n    if (typeof payload[0] === 'number') return payload;\n  }\n  if (payload && Array.isArray(payload.embedding)) return payload.embedding;\n  return null;\n}\n\nconst q = (v) => {\n  if (v === null || v === undefined || v === '') return 'NULL';\n  return `'${String(v).replace(/'/g, \"''\")}'`;\n};\n\nlet vec = extractVector(rawEmbedding);\nif (vec) {\n  vec = vec.map((n) => Number(n)).filter((n) => Number.isFinite(n));\n  if (vec.length > 384) vec = vec.slice(0, 384);\n  if (vec.length < 384) vec = vec.concat(Array(384 - vec.length).fill(0));\n}\n\nconst embeddingSql = vec ? `'[${vec.join(',')}]'::vector` : 'NULL';\n\nconst sql = `\nINSERT INTO osint_sources (\n  source_url,\n  raw_text,\n  clean_text,\n  source_rating,\n  source_tier,\n  posted_at,\n  content_hash,\n  embedding\n)\nVALUES (\n  ${q(src.source_url)},\n  ${q(src.raw_text)},\n  ${q(src.clean_text)},\n  ${q(src.source_rating)},\n  ${Number(src.source_tier)},\n  ${q(src.posted_at)}::timestamptz,\n  ${q(src.content_hash)},\n  ${embeddingSql}\n)\nON CONFLICT (content_hash) DO UPDATE\nSET\n  clean_text = EXCLUDED.clean_text,\n  posted_at = EXCLUDED.posted_at,\n  embedding = COALESCE(EXCLUDED.embedding, osint_sources.embedding);\n`;\n\nreturn { query: sql };"
+      },
+      "id": "62fab646-d8ea-4a08-9928-0ad625d3a446",
+      "name": "Build Source Insert SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $json.query }}",
+        "options": {}
+      },
+      "id": "0b5050c4-2dff-475f-9bfa-fed374df28e9",
+      "name": "Persist Source",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1376,
+        -64
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "jsfavr7uD4E6ZTyS",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "http://backend:8000/health",
+        "options": {}
+      },
+      "id": "83fb766f-a1a4-455d-a3f4-dd806379f6a9",
+      "name": "Backend Reachability Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1616,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "maxItems": 10
+      },
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        480,
+        -64
+      ],
+      "id": "2ae8c712-8c60-4585-af21-e4a7f921581a",
+      "name": "Limit"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        192
+      ],
+      "id": "f192e1c9-e6ff-4c74-a12a-1027b9c6f79c",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c0fcdecc-3909-4071-9298-c0702115acd6",
+              "name": "title",
+              "value": "Protest reported in Githurai",
+              "type": "string"
+            },
+            {
+              "id": "1d41b49b-cf46-4642-9de9-03c6dcf06bcd",
+              "name": "contentSnippet",
+              "value": "Residents report road blockage and police presence near Githurai 45.",
+              "type": "string"
+            },
+            {
+              "id": "e97cd2fa-f1c2-41c8-9128-c587ebf52273",
+              "name": "link",
+              "value": "manual://githurai-test-001",
+              "type": "string"
+            },
+            {
+              "id": "7e6680c1-2b43-4bb8-b611-6fccf7a02b0c",
+              "name": "isoDate",
+              "value": "2026-06-11T10:00:00+03:00",
+              "type": "string"
+            },
+            {
+              "id": "7bf0a2f6-e24a-4777-b9ef-f0a3be11c475",
+              "name": "source_rating",
+              "value": "C",
+              "type": "string"
+            },
+            {
+              "id": "561577ed-f2ef-4c68-ac45-7b9eb899fafa",
+              "name": "source_tier",
+              "value": 4,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        176,
+        192
+      ],
+      "id": "f7b6170d-a67c-4a5c-ab9d-035c43125bb6",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "int-ingestion",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "9cfa604e-09d0-4e46-a242-4ac88ff9d2e5",
+      "name": "Portal Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        368
+      ],
+      "webhookId": "int-ingestion-portal"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Cron Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch RSS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch RSS": {
+      "main": [
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Observation": {
+      "main": [
+        [
+          {
+            "node": "Build Source Insert SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Source Insert SQL": {
+      "main": [
+        [
+          {
+            "node": "Persist Source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Source": {
+      "main": [
+        [
+          {
+            "node": "Backend Reachability Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit": {
+      "main": [
+        [
+          {
+            "node": "Normalize Observation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Normalize Observation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Portal Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Observation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "debb2713-1f83-4048-ba0c-86fc35a56244",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "ccf6def36e6ea0e6ed22df778cc1c9c0a1c3f844190cf4d2412d5a12d06e61bf"
+  },
+  "id": "5rmbrcLjfY6QQkXh",
+  "tags": []
+}
