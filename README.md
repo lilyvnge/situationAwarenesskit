@@ -1,6 +1,6 @@
 # Intelligence Analyzer (Local-First MVP)
 
-This repository is a local-first foundation for an intelligence analysis platform focused on geopolitical and military OSINT events with geospatial and link analysis support.
+This repository is a local-first foundation for an intelligence analysis platform focused on geopolitical and military intelligence events with geospatial and link analysis support.
 
 ## What Is Included
 - Dockerized local stack:
@@ -9,7 +9,7 @@ This repository is a local-first foundation for an intelligence analysis platfor
   - n8n
   - FastAPI backend
 - Core database schema for:
-  - `osint_sources`
+  - `int_sources`
   - `actors`
   - `events`
   - `event_links`
