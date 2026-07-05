@@ -96,6 +96,12 @@ export async function fetchCampaignNetwork(campaignId) {
   return apiGet(`/campaigns/${campaignId}/network`);
 }
 
+export async function runEventLinking() {
+  return apiRequest("/campaigns/link-events", {
+    method: "POST"
+  });
+}
+
 export async function searchMaxarImages({ bbox, startDate, endDate, limit = 10 }) {
   const params = new URLSearchParams();
   params.set("bbox", bbox);

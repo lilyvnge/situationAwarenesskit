@@ -682,7 +682,7 @@ function CampaignPage() {
           <div>
             <span className="login-kicker">Campaign Builder</span>
             <h1>Campaign Link Analysis</h1>
-            <p>Build campaign context from event geography and linkage patterns.</p>
+            <p>View campaign context from event geography and linkage patterns.</p>
           </div>
         </div>
         <div className="control-account">

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { updateEventDetails, updateEventLinkStatus, updateEventStatus } from "../api";
+import { runEventLinking, updateEventDetails, updateEventLinkStatus, updateEventStatus } from "../api";
 import { useAuth } from "../auth/AuthContext";
 
 const EVENT_STATUSES = [
@@ -65,6 +65,26 @@ function formatValue(value) {
   return value || value === 0 ? value : "n/a";
 }
 
+function formatNumber(value, digits = 1) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return number.toFixed(digits);
+}
+
+function formatDateTime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short"
+  }).format(date);
+}
+
+function compactList(values) {
+  return Array.isArray(values) ? values.filter(Boolean) : [];
+}
+
 function Item({ label, value }) {
   return (
     <div className="detail-item">
@@ -122,7 +142,12 @@ function LinkList({ eventId, links, canAct, onAction }) {
           <div className="link-row-main">
             <div>
               <strong>Event #{link.related_event_id}</strong>
-              <span>{formatValue(link.related_event_class)} · {formatValue(link.related_country)}</span>
+              <span>
+                {formatValue(link.related_event_class)}
+                {link.related_event_subclass ? ` / ${link.related_event_subclass}` : ""}
+                {" · "}
+                {formatValue(link.related_location_name || link.related_country)}
+              </span>
             </div>
             <span className="status-pill">{link.status}</span>
           </div>
@@ -130,7 +155,37 @@ function LinkList({ eventId, links, canAct, onAction }) {
             <span>{formatValue(link.relationship_type)}</span>
             <span>Confidence {Number(link.link_confidence || 0).toFixed(2)}</span>
             <span>{formatValue(link.created_by)}</span>
+            {formatDateTime(link.related_started_at) && <span>{formatDateTime(link.related_started_at)}</span>}
+            {formatNumber(link.time_delta_hours) && <span>Δ {formatNumber(link.time_delta_hours)}h</span>}
+            {formatNumber(link.distance_km) && <span>{formatNumber(link.distance_km)} km</span>}
           </div>
+          <div className="link-context-grid">
+            <div>
+              <span className="label">Shared Actors</span>
+              <strong>{formatValue(link.shared_actor_names)}</strong>
+            </div>
+            <div>
+              <span className="label">Shared Location</span>
+              <strong>{formatValue(link.shared_location_name)}</strong>
+            </div>
+            <div>
+              <span className="label">Related Location</span>
+              <strong>{formatValue([link.related_city, link.related_state, link.related_country].filter(Boolean).join(", "))}</strong>
+            </div>
+            <div>
+              <span className="label">Weapon Match</span>
+              <strong>{formatValue(link.shared_weapon)}</strong>
+            </div>
+            <div>
+              <span className="label">Related Weapon</span>
+              <strong>{formatValue(link.related_weapon_system || link.related_weapon_category)}</strong>
+            </div>
+            <div>
+              <span className="label">Link Factors</span>
+              <strong>{formatValue(compactList(link.link_factors))}</strong>
+            </div>
+          </div>
+          {link.related_description && <p className="link-description">{link.related_description}</p>}
           {link.notes && <p>{link.notes}</p>}
           {canAct && link.status === "proposed" && (
             <div className="detail-actions">
@@ -158,12 +213,15 @@ export default function EventDetailPanel({ eventDetail, onEventUpdated }) {
   const [editing, setEditing] = useState(false);
   const [editForm, setEditForm] = useState({});
   const [savingEdit, setSavingEdit] = useState(false);
+  const [runningLinks, setRunningLinks] = useState(false);
+  const [linkRunSummary, setLinkRunSummary] = useState(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
     setStatus(eventDetail?.status || "");
     setNotes("");
     setError("");
+    setLinkRunSummary(null);
     setEditing(false);
     setEditForm(eventDetail ? editableFormFromEvent(eventDetail) : {});
   }, [eventDetail]);
@@ -231,6 +289,22 @@ export default function EventDetailPanel({ eventDetail, onEventUpdated }) {
       setError(err.message || "Unable to update event details.");
     } finally {
       setSavingEdit(false);
+    }
+  };
+
+  const handleRunLinkAnalysis = async () => {
+    if (!canManage) return;
+    setRunningLinks(true);
+    setError("");
+    setLinkRunSummary(null);
+    try {
+      const summary = await runEventLinking();
+      setLinkRunSummary(summary);
+      await onEventUpdated?.();
+    } catch (err) {
+      setError(err.message || "Unable to run link analysis.");
+    } finally {
+      setRunningLinks(false);
     }
   };
 
@@ -456,7 +530,20 @@ export default function EventDetailPanel({ eventDetail, onEventUpdated }) {
       </div>
 
       <div className="detail-text-block">
-        <h3>Proposed Links</h3>
+        <div className="detail-section-header">
+          <h3>Proposed Links</h3>
+          {canManage && (
+            <button className="ghost-button detail-link-run-button" type="button" onClick={handleRunLinkAnalysis} disabled={runningLinks}>
+              {runningLinks ? "Running..." : "Run Link Analysis"}
+            </button>
+          )}
+        </div>
+        {linkRunSummary && (
+          <p className="link-run-summary">
+            Considered {linkRunSummary.events_considered ?? 0} events over {linkRunSummary.lookback_interval || "30 days"} ·{" "}
+            {linkRunSummary.links_upserted ?? 0} links upserted · {linkRunSummary.campaigns?.length ?? 0} campaign clusters
+          </p>
+        )}
         <LinkList eventId={eventDetail.id} links={eventDetail.proposed_links} canAct={canManage} onAction={onEventUpdated} />
       </div>
 

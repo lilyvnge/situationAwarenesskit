@@ -950,8 +950,62 @@ def get_event(event_id: int, _: AuthUser = Depends(require_roles("admin", "analy
             el.id,
             CASE WHEN el.event_id_1 = %(event_id)s THEN el.event_id_2 ELSE el.event_id_1 END AS related_event_id,
             related.event_class AS related_event_class,
+            related.event_subclass AS related_event_subclass,
             related.country AS related_country,
+            related.admin1 AS related_admin1,
+            COALESCE(related.state, related.admin1) AS related_state,
+            related.city AS related_city,
+            COALESCE(NULLIF(related.city, ''), NULLIF(COALESCE(related.state, related.admin1), ''), NULLIF(related.country, '')) AS related_location_name,
             related.started_at AS related_started_at,
+            related.description AS related_description,
+            related.weapon_system AS related_weapon_system,
+            related.weapon_category AS related_weapon_category,
+            ARRAY(
+                SELECT DISTINCT shared_actor_name
+                FROM (
+                    VALUES
+                        (CASE WHEN current_event.actor_initiator_id IS NOT NULL AND current_event.actor_initiator_id IN (related.actor_initiator_id, related.actor_target_id) THEN current_initiator.name END),
+                        (CASE WHEN current_event.actor_target_id IS NOT NULL AND current_event.actor_target_id IN (related.actor_initiator_id, related.actor_target_id) THEN current_target.name END)
+                ) AS shared(shared_actor_name)
+                WHERE shared_actor_name IS NOT NULL
+            ) AS shared_actor_names,
+            CASE
+                WHEN NULLIF(current_event.city, '') IS NOT NULL
+                 AND LOWER(current_event.city) = LOWER(related.city)
+                    THEN related.city
+                WHEN NULLIF(COALESCE(current_event.state, current_event.admin1), '') IS NOT NULL
+                 AND LOWER(COALESCE(current_event.state, current_event.admin1)) = LOWER(COALESCE(related.state, related.admin1))
+                 AND LOWER(COALESCE(current_event.country, '')) = LOWER(COALESCE(related.country, ''))
+                    THEN COALESCE(related.state, related.admin1)
+                WHEN NULLIF(current_event.country, '') IS NOT NULL
+                 AND LOWER(current_event.country) = LOWER(related.country)
+                    THEN related.country
+                ELSE NULL
+            END AS shared_location_name,
+            CASE
+                WHEN NULLIF(current_event.weapon_system, '') IS NOT NULL
+                 AND LOWER(current_event.weapon_system) = LOWER(related.weapon_system)
+                    THEN related.weapon_system
+                WHEN NULLIF(current_event.weapon_category, '') IS NOT NULL
+                 AND LOWER(current_event.weapon_category) = LOWER(related.weapon_category)
+                    THEN related.weapon_category
+                ELSE NULL
+            END AS shared_weapon,
+            CASE
+                WHEN current_event.geom IS NOT NULL AND related.geom IS NOT NULL
+                    THEN ROUND((ST_Distance(current_event.geom::geography, related.geom::geography) / 1000.0)::numeric, 1)::float
+                ELSE NULL
+            END AS distance_km,
+            CASE
+                WHEN current_event.started_at IS NOT NULL AND related.started_at IS NOT NULL
+                    THEN ROUND((ABS(EXTRACT(EPOCH FROM (current_event.started_at - related.started_at))) / 3600.0)::numeric, 1)::float
+                ELSE NULL
+            END AS time_delta_hours,
+            CASE
+                WHEN POSITION('factors=' IN COALESCE(el.notes, '')) > 0
+                    THEN string_to_array(split_part(el.notes, 'factors=', 2), ',')
+                ELSE ARRAY[]::text[]
+            END AS link_factors,
             el.relationship_type,
             el.link_confidence,
             el.status,
@@ -959,8 +1013,12 @@ def get_event(event_id: int, _: AuthUser = Depends(require_roles("admin", "analy
             el.created_by,
             el.created_at
         FROM event_links el
+        JOIN events current_event
+          ON current_event.id = %(event_id)s
         JOIN events related
           ON related.id = CASE WHEN el.event_id_1 = %(event_id)s THEN el.event_id_2 ELSE el.event_id_1 END
+        LEFT JOIN actors current_initiator ON current_initiator.id = current_event.actor_initiator_id
+        LEFT JOIN actors current_target ON current_target.id = current_event.actor_target_id
         WHERE el.event_id_1 = %(event_id)s OR el.event_id_2 = %(event_id)s
         ORDER BY
             CASE el.status

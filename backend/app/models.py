@@ -156,8 +156,22 @@ class EventLinkDetail(BaseModel):
     id: int
     related_event_id: int
     related_event_class: Optional[str] = None
+    related_event_subclass: Optional[str] = None
     related_country: Optional[str] = None
+    related_admin1: Optional[str] = None
+    related_state: Optional[str] = None
+    related_city: Optional[str] = None
+    related_location_name: Optional[str] = None
     related_started_at: Optional[datetime] = None
+    related_description: Optional[str] = None
+    related_weapon_system: Optional[str] = None
+    related_weapon_category: Optional[str] = None
+    shared_actor_names: List[str] = Field(default_factory=list)
+    shared_location_name: Optional[str] = None
+    shared_weapon: Optional[str] = None
+    distance_km: Optional[float] = None
+    time_delta_hours: Optional[float] = None
+    link_factors: List[str] = Field(default_factory=list)
     relationship_type: Optional[str] = None
     link_confidence: Optional[float] = None
     status: str

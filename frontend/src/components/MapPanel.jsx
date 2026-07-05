@@ -93,7 +93,7 @@ function popupHtml(properties, canManageInterest, canBuildCampaign, canSurveille
       }
       ${
         canBuildCampaign
-          ? `<button class="map-build-campaign-action" type="button" data-event-id="${escapeHtml(properties.id)}">Build Campaign</button>`
+          ? `<button class="map-build-campaign-action" type="button" data-event-id="${escapeHtml(properties.id)}">View Campaign</button>`
           : ""
       }
       ${
