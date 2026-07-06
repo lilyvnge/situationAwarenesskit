@@ -149,6 +149,129 @@ function formatCatalogNumber(value, digits = 1) {
   return number.toFixed(digits);
 }
 
+function formatCampaignDate(value) {
+  if (!value) return "n/a";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short"
+  }).format(date);
+}
+
+function compactCampaignList(values, limit = 4) {
+  const items = Array.isArray(values) ? values.filter(Boolean) : [];
+  if (!items.length) return "n/a";
+  const visible = items.slice(0, limit).join(", ");
+  return items.length > limit ? `${visible} +${items.length - limit}` : visible;
+}
+
+function eventLocation(properties) {
+  return [properties?.city, properties?.state || properties?.admin1, properties?.country].filter(Boolean).join(", ") || "n/a";
+}
+
+function CampaignSignalBlock({ label, values }) {
+  const items = Array.isArray(values) ? [...new Set(values.filter(Boolean))] : [];
+  return (
+    <div className="campaign-signal-block">
+      <span>{label}</span>
+      {items.length ? (
+        <div className="campaign-chip-list">
+          {items.slice(0, 10).map((item, index) => (
+            <strong key={`${label}-${item}-${index}`}>{item}</strong>
+          ))}
+          {items.length > 10 && <strong>+{items.length - 10}</strong>}
+        </div>
+      ) : (
+        <em>n/a</em>
+      )}
+    </div>
+  );
+}
+
+function CampaignSummaryPanel({ campaign, events, selectedEventId, onSelectEvent }) {
+  const eventRows = events.map((feature) => feature.properties || {});
+  const topEvents = eventRows.slice(0, 10);
+  const actorNames = [
+    ...(campaign?.initiator_names || []),
+    ...(campaign?.target_names || [])
+  ].filter(Boolean);
+
+  return (
+    <div className="panel campaign-summary-panel">
+      <header className="panel-title-row">
+        <div>
+          <h2>Campaign Summary</h2>
+          <span className="mono">{campaign ? `Campaign #${campaign.id}` : "No campaign selected"}</span>
+        </div>
+        {campaign?.status && <span className={`status-pill status-${campaign.status}`}>{campaign.status}</span>}
+      </header>
+
+      {!campaign ? (
+        <div className="campaign-summary-scroll">
+          <p className="empty-note">Select an Auto Campaign to view linked event context.</p>
+        </div>
+      ) : (
+        <div className="campaign-summary-scroll">
+          <div className="campaign-summary-copy">
+            <strong>{campaign.name}</strong>
+            <p>{campaign.description || "Automated campaign cluster from linked events."}</p>
+          </div>
+
+          <div className="campaign-metric-grid">
+            <div>
+              <span>Events</span>
+              <strong>{campaign.event_count ?? eventRows.length}</strong>
+            </div>
+            <div>
+              <span>Severity</span>
+              <strong>{campaign.max_severity ? `${campaign.max_severity}/5` : "n/a"}</strong>
+            </div>
+            <div>
+              <span>First Seen</span>
+              <strong>{formatCampaignDate(campaign.first_event_at)}</strong>
+            </div>
+            <div>
+              <span>Latest Seen</span>
+              <strong>{formatCampaignDate(campaign.latest_event_at)}</strong>
+            </div>
+          </div>
+
+          <div className="campaign-signal-grid">
+            <CampaignSignalBlock label="Actors" values={actorNames} />
+            <CampaignSignalBlock label="Countries" values={campaign.countries} />
+            <CampaignSignalBlock label="Locations" values={campaign.locations} />
+            <CampaignSignalBlock label="Classes" values={campaign.event_classes} />
+            <CampaignSignalBlock label="Weapons" values={[...(campaign.weapon_systems || []), ...(campaign.weapon_categories || [])]} />
+          </div>
+
+          <div className="campaign-linked-events">
+            <div className="campaign-linked-events-title">
+              <strong>Linked Events</strong>
+              <span className="mono">{eventRows.length} loaded</span>
+            </div>
+            {topEvents.map((properties) => (
+              <button
+                key={properties.id}
+                type="button"
+                className={properties.id === selectedEventId ? "active" : ""}
+                onClick={() => onSelectEvent?.(properties.id)}
+              >
+                <span className="mono">#{properties.id} · {formatCampaignDate(properties.started_at)}</span>
+                <strong>{properties.event_class || "unknown"} · {eventLocation(properties)}</strong>
+                <small>
+                  {[properties.actor_initiator_name, properties.actor_target_name].filter(Boolean).join(" -> ") || "Actors n/a"}
+                </small>
+              </button>
+            ))}
+            {!eventRows.length && <p className="empty-note">Campaign event details are loading.</p>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const route =
     window.location.pathname === "/portal"
@@ -620,7 +743,17 @@ function CampaignPage() {
       const nextCampaignId = selectedCampaignId || campaignFromEvent?.id || campaignRows[0]?.id || null;
       setSelectedCampaignId(nextCampaignId);
 
-      if (!nextCampaignId) {
+      if (nextCampaignId) {
+        const [eventCollection, networkData] = await Promise.all([
+          fetchCampaignEvents(nextCampaignId),
+          fetchCampaignNetwork(nextCampaignId)
+        ]);
+        setEvents(eventCollection.features || []);
+        setNetwork(networkData);
+        if (!selectedEventId && eventCollection.features?.[0]?.properties?.id) {
+          setSelectedEventId(eventCollection.features[0].properties.id);
+        }
+      } else {
         const [eventCollection, networkData] = await Promise.all([
           fetchEvents({ limit: 600 }),
           fetchNetwork(initialEventId || undefined)
@@ -693,6 +826,9 @@ function CampaignPage() {
           <button className="theme-toggle" type="button" onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
             {theme === "dark" ? "Light" : "Dark"}
           </button>
+          <button className="ghost-button" type="button" onClick={loadCampaigns} disabled={loading}>
+            Refresh
+          </button>
           <button className="ghost-button" type="button" onClick={() => { window.location.href = "/"; }}>
             Dashboard
           </button>
@@ -736,6 +872,14 @@ function CampaignPage() {
             </div>
           </div>
           {loading && <div className="campaign-loading mono">Loading campaign context...</div>}
+          <CampaignSummaryPanel
+            campaign={selectedCampaign}
+            events={events}
+            selectedEventId={selectedEventId}
+            onSelectEvent={setSelectedEventId}
+          />
+        </section>
+        <section className="campaign-network-section">
           <NetworkPanel network={network} selectedEventId={selectedEventId} onSelectEvent={setSelectedEventId} />
         </section>
       </main>

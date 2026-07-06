@@ -1,12 +1,12 @@
-import math
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .db import get_conn
+from .linking_rules import is_linkable_actor_name, is_linkable_weapon_name
 
 LOOKBACK_INTERVAL = "30 days"
-LINK_THRESHOLD = 0.4
+LINK_THRESHOLD = 0.48
 MIN_CAMPAIGN_EVENTS = 3
 RELATIONSHIP_TYPE = "automated_campaign"
 
@@ -16,11 +16,11 @@ def _norm(value: Any) -> str:
 
 
 def _actor_ids(event: Dict[str, Any]) -> Set[int]:
-    return {
-        actor_id
-        for actor_id in (event.get("actor_initiator_id"), event.get("actor_target_id"))
-        if actor_id is not None
-    }
+    actors = [
+        (event.get("actor_initiator_id"), event.get("actor_initiator_name")),
+        (event.get("actor_target_id"), event.get("actor_target_name")),
+    ]
+    return {actor_id for actor_id, name in actors if actor_id is not None and is_linkable_actor_name(name)}
 
 
 def _hours_between(left: Optional[datetime], right: Optional[datetime]) -> Optional[float]:
@@ -33,20 +33,6 @@ def _hours_between(left: Optional[datetime], right: Optional[datetime]) -> Optio
     return abs((left - right).total_seconds()) / 3600
 
 
-def _distance_km(left: Dict[str, Any], right: Dict[str, Any]) -> Optional[float]:
-    if left.get("lat") is None or left.get("lon") is None or right.get("lat") is None or right.get("lon") is None:
-        return None
-
-    lat1 = math.radians(float(left["lat"]))
-    lon1 = math.radians(float(left["lon"]))
-    lat2 = math.radians(float(right["lat"]))
-    lon2 = math.radians(float(right["lon"]))
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return 6371 * (2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
-
-
 def _location_score(left: Dict[str, Any], right: Dict[str, Any]) -> float:
     left_city = _norm(left.get("city"))
     right_city = _norm(right.get("city"))
@@ -55,32 +41,22 @@ def _location_score(left: Dict[str, Any], right: Dict[str, Any]) -> float:
 
     left_state = _norm(left.get("state") or left.get("admin1"))
     right_state = _norm(right.get("state") or right.get("admin1"))
-    if left_state and left_state == right_state and _norm(left.get("country")) == _norm(right.get("country")):
+    left_has_city = bool(left_city)
+    right_has_city = bool(right_city)
+    if (not left_has_city or not right_has_city) and left_state and left_state == right_state:
         return 0.78
-
-    distance = _distance_km(left, right)
-    if distance is not None:
-        if distance <= 25:
-            return 0.9
-        if distance <= 100:
-            return 0.72
-        if distance <= 300:
-            return 0.45
-
-    if _norm(left.get("country")) and _norm(left.get("country")) == _norm(right.get("country")):
-        return 0.34
     return 0.0
 
 
 def _weapon_score(left: Dict[str, Any], right: Dict[str, Any]) -> float:
     left_system = _norm(left.get("weapon_system"))
     right_system = _norm(right.get("weapon_system"))
-    if left_system and left_system == right_system:
+    if left_system and left_system == right_system and is_linkable_weapon_name(left_system):
         return 1.0
 
     left_category = _norm(left.get("weapon_category"))
     right_category = _norm(right.get("weapon_category"))
-    if left_category and left_category == right_category:
+    if left_category and left_category == right_category and is_linkable_weapon_name(left_category):
         return 0.72
     return 0.0
 
@@ -165,13 +141,17 @@ def build_campaign_event_links(actor: str = "system") -> Dict[str, Any]:
                     e.started_at,
                     e.actor_initiator_id,
                     e.actor_target_id,
+                    ai.name AS actor_initiator_name,
+                    at.name AS actor_target_name,
                     e.weapon_system,
                     e.weapon_category,
                     ST_X(e.geom) AS lon,
                     ST_Y(e.geom) AS lat
                 FROM events e
-                WHERE COALESCE(e.started_at, e.created_at) >= NOW() - %(lookback_interval)s::interval
-                ORDER BY COALESCE(e.started_at, e.created_at) DESC, e.id DESC
+                LEFT JOIN actors ai ON ai.id = e.actor_initiator_id
+                LEFT JOIN actors at ON at.id = e.actor_target_id
+                WHERE e.started_at >= NOW() - %(lookback_interval)s::interval
+                ORDER BY e.started_at DESC, e.id DESC
                 """,
                 {"lookback_interval": LOOKBACK_INTERVAL},
             )
@@ -179,6 +159,7 @@ def build_campaign_event_links(actor: str = "system") -> Dict[str, Any]:
 
             inserted_links: List[Dict[str, Any]] = []
             qualifying_edges: List[Tuple[int, int]] = []
+            qualifying_edge_keys: Set[Tuple[int, int]] = set()
             for index, left in enumerate(events):
                 for right in events[index + 1 :]:
                     confidence, reasons = score_event_pair(left, right)
@@ -187,6 +168,7 @@ def build_campaign_event_links(actor: str = "system") -> Dict[str, Any]:
 
                     left_id, right_id = sorted((left["id"], right["id"]))
                     qualifying_edges.append((left_id, right_id))
+                    qualifying_edge_keys.add((left_id, right_id))
                     cur.execute(
                         """
                         INSERT INTO event_links (
@@ -209,7 +191,7 @@ def build_campaign_event_links(actor: str = "system") -> Dict[str, Any]:
                         )
                         ON CONFLICT (event_id_1, event_id_2, relationship_type)
                         DO UPDATE SET
-                            link_confidence = GREATEST(event_links.link_confidence, EXCLUDED.link_confidence),
+                            link_confidence = EXCLUDED.link_confidence,
                             notes = EXCLUDED.notes
                         RETURNING id
                         """,
@@ -234,6 +216,31 @@ def build_campaign_event_links(actor: str = "system") -> Dict[str, Any]:
                     )
 
             event_ids = {event["id"] for event in events}
+            stale_links_removed = 0
+            if event_ids:
+                cur.execute(
+                    """
+                    SELECT id, event_id_1, event_id_2
+                    FROM event_links
+                    WHERE relationship_type = %(relationship_type)s
+                      AND status = 'proposed'
+                      AND event_id_1 = ANY(%(event_ids)s)
+                      AND event_id_2 = ANY(%(event_ids)s)
+                    """,
+                    {"relationship_type": RELATIONSHIP_TYPE, "event_ids": list(event_ids)},
+                )
+                stale_link_ids = [
+                    row["id"]
+                    for row in cur.fetchall()
+                    if (row["event_id_1"], row["event_id_2"]) not in qualifying_edge_keys
+                ]
+                if stale_link_ids:
+                    cur.execute(
+                        "DELETE FROM event_links WHERE id = ANY(%(link_ids)s)",
+                        {"link_ids": stale_link_ids},
+                    )
+                    stale_links_removed = len(stale_link_ids)
+
             components = [
                 component
                 for component in _connected_components(event_ids, qualifying_edges)
@@ -299,6 +306,7 @@ def build_campaign_event_links(actor: str = "system") -> Dict[str, Any]:
                     "actor": actor,
                     "details": (
                         f"events={len(events)}; links={len(inserted_links)}; "
+                        f"stale_links_removed={stale_links_removed}; "
                         f"campaign_clusters={len(campaign_assignments)}"
                     ),
                 },
@@ -310,6 +318,7 @@ def build_campaign_event_links(actor: str = "system") -> Dict[str, Any]:
         "events_considered": len(events),
         "lookback_interval": LOOKBACK_INTERVAL,
         "links_upserted": len(inserted_links),
+        "stale_links_removed": stale_links_removed,
         "campaign_clusters": len(campaign_assignments),
         "links": inserted_links,
         "campaigns": campaign_assignments,

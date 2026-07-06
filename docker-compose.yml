@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: intel
       POSTGRES_PASSWORD: intel
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./infrastructure/db/init:/docker-entrypoint-initdb.d
@@ -23,7 +23,7 @@ services:
     image: redis:7-alpine
     container_name: intel_redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -39,7 +39,7 @@ services:
       APP_ENV: local
       DATABASE_URL: postgresql://intel:intel@db:5432/intel
       REDIS_URL: redis://redis:6379/0
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:5678,http://${LAN_HOST:-localhost}:3000,http://${LAN_HOST:-localhost}:5173}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:5678}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-local-dev-change-me}
       JWT_EXPIRES_MINUTES: ${JWT_EXPIRES_MINUTES:-480}
       AUTH_USERS: ${AUTH_USERS:-admin:admin123:admin,analyst:analyst123:analyst,viewer:viewer123:viewer,portal:portal123:submitter}
@@ -47,7 +47,7 @@ services:
       MAXAR_API_KEY: ${MAXAR_API_KEY:-}
       MAXAR_CATALOG_SEARCH_URL: ${MAXAR_CATALOG_SEARCH_URL:-https://api.maxar.com/discovery/v1/catalogs/imagery/search}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -58,7 +58,7 @@ services:
     image: n8nio/n8n:latest
     container_name: intel_n8n
     ports:
-      - "5678:5678"
+      - "127.0.0.1:5678:5678"
     dns:
       - 1.1.1.1
       - 8.8.8.8
@@ -92,13 +92,13 @@ services:
       context: ./frontend
     container_name: intel_frontend
     environment:
-      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://${LAN_HOST:-localhost}:8000}
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
       VITE_MAXAR_API_KEY: ${VITE_MAXAR_API_KEY:-}
       VITE_MAXAR_TILE_URL: ${VITE_MAXAR_TILE_URL:-}
       VITE_MAXAR_WMS_URL: ${VITE_MAXAR_WMS_URL:-https://api.maxar.com/streaming/v1/ogc/wms}
       VITE_MAXAR_WMS_LAYERS: ${VITE_MAXAR_WMS_LAYERS:-Maxar:Imagery}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       backend:
         condition: service_started

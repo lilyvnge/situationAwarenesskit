@@ -13,6 +13,7 @@ from .campaign_linker import build_campaign_event_links
 from .classifier import classification_schema, classify
 from .config import settings
 from .db import execute, fetch_all, fetch_one
+from .linking_rules import IGNORED_SHARED_ACTOR_NAMES, IGNORED_SHARED_WEAPON_NAMES
 from .models import (
     AuthUser,
     ClassifyRequest,
@@ -36,6 +37,8 @@ from .models import (
 )
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
+IGNORED_SHARED_ACTOR_NAMES_PARAM = sorted(IGNORED_SHARED_ACTOR_NAMES)
+IGNORED_SHARED_WEAPON_NAMES_PARAM = sorted(IGNORED_SHARED_WEAPON_NAMES)
 
 app.add_middleware(
     CORSMiddleware,
@@ -615,7 +618,7 @@ def list_events(
 ) -> GeoJSONFeatureCollection:
     where = [
         "e.map_removed_at IS NULL",
-        "(e.is_marked_interest IS TRUE OR e.started_at >= NOW() - INTERVAL '24 hours')",
+        "(e.is_marked_interest IS TRUE OR e.created_at >= NOW() - INTERVAL '24 hours')",
     ]
     params: Dict[str, object] = {"limit": limit, "offset": offset}
 
@@ -648,6 +651,7 @@ def list_events(
             e.city,
             e.started_at,
             e.started_at_original,
+            e.created_at,
             e.ai_confidence,
             e.status,
             e.weapon_system,
@@ -667,7 +671,7 @@ def list_events(
             ST_Y(e.geom) AS lat
         FROM events e
         {where_sql}
-        ORDER BY e.started_at DESC NULLS LAST, e.id DESC
+        ORDER BY e.created_at DESC, e.started_at DESC NULLS LAST, e.id DESC
         LIMIT %(limit)s
         OFFSET %(offset)s
     """
@@ -762,20 +766,51 @@ def list_campaigns(
 ) -> List[Dict[str, object]]:
     return fetch_all(
         """
+        WITH campaign_rows AS (
+            SELECT
+                c.id,
+                c.name,
+                c.description,
+                c.status,
+                c.created_at,
+                e.id AS event_id,
+                COALESCE(e.started_at, e.created_at) AS event_time,
+                e.event_class,
+                e.country,
+                COALESCE(NULLIF(e.city, ''), NULLIF(COALESCE(e.state, e.admin1), ''), NULLIF(e.country, '')) AS location_name,
+                e.weapon_system,
+                e.weapon_category,
+                e.severity,
+                ai.name AS initiator_name,
+                at.name AS target_name
+            FROM campaigns c
+            LEFT JOIN campaign_events ce ON ce.campaign_id = c.id
+            LEFT JOIN events e ON e.id = ce.event_id
+            LEFT JOIN actors ai ON ai.id = e.actor_initiator_id
+            LEFT JOIN actors at ON at.id = e.actor_target_id
+        )
         SELECT
-            c.id,
-            c.name,
-            c.description,
-            c.status,
-            c.created_at,
-            COUNT(ce.event_id)::int AS event_count,
-            ARRAY_REMOVE(ARRAY_AGG(ce.event_id ORDER BY e.started_at DESC NULLS LAST, e.id DESC), NULL) AS event_ids,
-            MAX(COALESCE(e.started_at, e.created_at)) AS latest_event_at
-        FROM campaigns c
-        LEFT JOIN campaign_events ce ON ce.campaign_id = c.id
-        LEFT JOIN events e ON e.id = ce.event_id
-        GROUP BY c.id
-        ORDER BY latest_event_at DESC NULLS LAST, c.created_at DESC
+            id,
+            name,
+            description,
+            status,
+            created_at,
+            COUNT(event_id)::int AS event_count,
+            ARRAY_REMOVE(ARRAY_AGG(event_id ORDER BY event_time DESC NULLS LAST, event_id DESC), NULL) AS event_ids,
+            MIN(event_time) AS first_event_at,
+            MAX(event_time) AS latest_event_at,
+            MAX(severity) AS max_severity,
+            ROUND(AVG(severity)::numeric, 1)::float AS average_severity,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT event_class), NULL) AS event_classes,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT country), NULL) AS countries,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT location_name), NULL) AS locations,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT weapon_system), NULL) AS weapon_systems,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT weapon_category), NULL) AS weapon_categories,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT initiator_name), NULL) AS initiator_names,
+            ARRAY_REMOVE(ARRAY_AGG(DISTINCT target_name), NULL) AS target_names
+        FROM campaign_rows
+        GROUP BY id, name, description, status, created_at
+        ORDER BY latest_event_at DESC NULLS LAST, created_at DESC
         LIMIT %(limit)s
         """,
         {"limit": limit},
@@ -805,10 +840,14 @@ def get_campaign_events(
             e.weapon_category,
             e.severity,
             e.is_marked_interest,
+            ai.name AS actor_initiator_name,
+            at.name AS actor_target_name,
             ST_X(e.geom) AS lon,
             ST_Y(e.geom) AS lat
         FROM campaign_events ce
         JOIN events e ON e.id = ce.event_id
+        LEFT JOIN actors ai ON ai.id = e.actor_initiator_id
+        LEFT JOIN actors at ON at.id = e.actor_target_id
         WHERE ce.campaign_id = %(campaign_id)s
         ORDER BY COALESCE(e.started_at, e.created_at) DESC, e.id DESC
         """,
@@ -852,23 +891,98 @@ def get_campaign_network(
             el.event_id_2,
             el.relationship_type,
             el.link_confidence,
-            el.status
+            el.status,
+            el.notes,
+            el.created_by,
+            el.created_at,
+            CASE
+                WHEN POSITION('factors=' IN COALESCE(el.notes, '')) > 0
+                    THEN string_to_array(split_part(split_part(el.notes, 'factors=', 2), ';', 1), ',')
+                ELSE ARRAY[]::text[]
+            END AS link_factors,
+            CASE
+                WHEN e1.geom IS NOT NULL AND e2.geom IS NOT NULL
+                    THEN ROUND((ST_Distance(e1.geom::geography, e2.geom::geography) / 1000.0)::numeric, 1)::float
+                ELSE NULL
+            END AS distance_km,
+            CASE
+                WHEN e1.started_at IS NOT NULL AND e2.started_at IS NOT NULL
+                    THEN ROUND((ABS(EXTRACT(EPOCH FROM (e1.started_at - e2.started_at))) / 3600.0)::numeric, 1)::float
+                ELSE NULL
+            END AS time_delta_hours,
+            CASE
+                WHEN NULLIF(e1.city, '') IS NOT NULL
+                 AND LOWER(e1.city) = LOWER(e2.city)
+                    THEN e1.city
+                WHEN NULLIF(COALESCE(e1.state, e1.admin1), '') IS NOT NULL
+                 AND (NULLIF(e1.city, '') IS NULL OR NULLIF(e2.city, '') IS NULL)
+                 AND LOWER(COALESCE(e1.state, e1.admin1)) = LOWER(COALESCE(e2.state, e2.admin1))
+                    THEN COALESCE(e1.state, e1.admin1)
+                ELSE NULL
+            END AS shared_location_name,
+            CASE
+                WHEN NULLIF(e1.weapon_system, '') IS NOT NULL
+                 AND LOWER(e1.weapon_system) = LOWER(e2.weapon_system)
+                 AND NOT (LOWER(TRIM(e1.weapon_system)) = ANY(%(ignored_shared_weapon_names)s))
+                    THEN e1.weapon_system
+                WHEN NULLIF(e1.weapon_category, '') IS NOT NULL
+                 AND LOWER(e1.weapon_category) = LOWER(e2.weapon_category)
+                 AND NOT (LOWER(TRIM(e1.weapon_category)) = ANY(%(ignored_shared_weapon_names)s))
+                    THEN e1.weapon_category
+                ELSE NULL
+            END AS shared_weapon,
+            ARRAY(
+                SELECT DISTINCT shared_actor_name
+                FROM (
+                    VALUES
+                        (CASE WHEN e1.actor_initiator_id IS NOT NULL AND e1.actor_initiator_id IN (e2.actor_initiator_id, e2.actor_target_id) THEN e1_initiator.name END),
+                        (CASE WHEN e1.actor_target_id IS NOT NULL AND e1.actor_target_id IN (e2.actor_initiator_id, e2.actor_target_id) THEN e1_target.name END)
+                ) AS shared(shared_actor_name)
+                WHERE shared_actor_name IS NOT NULL
+                  AND NOT (LOWER(TRIM(shared_actor_name)) = ANY(%(ignored_shared_actor_names)s))
+            ) AS shared_actor_names
         FROM event_links el
+        JOIN events e1 ON e1.id = el.event_id_1
+        JOIN events e2 ON e2.id = el.event_id_2
+        LEFT JOIN actors e1_initiator ON e1_initiator.id = e1.actor_initiator_id
+        LEFT JOIN actors e1_target ON e1_target.id = e1.actor_target_id
         WHERE el.event_id_1 = ANY(%(event_ids)s)
           AND el.event_id_2 = ANY(%(event_ids)s)
         ORDER BY el.link_confidence DESC NULLS LAST, el.created_at DESC
         """,
-        {"event_ids": event_ids},
+        {
+            "event_ids": event_ids,
+            "ignored_shared_actor_names": IGNORED_SHARED_ACTOR_NAMES_PARAM,
+            "ignored_shared_weapon_names": IGNORED_SHARED_WEAPON_NAMES_PARAM,
+        },
     )
     nodes = fetch_all(
         """
         SELECT
             e.id,
             e.event_class,
+            e.event_subclass,
             e.country,
+            e.admin1,
+            COALESCE(e.state, e.admin1) AS state,
+            e.city,
+            COALESCE(NULLIF(e.city, ''), NULLIF(COALESCE(e.state, e.admin1), ''), NULLIF(e.country, '')) AS location_name,
             e.started_at,
-            e.ai_confidence
+            e.ai_confidence,
+            e.status,
+            e.weapon_system,
+            e.weapon_category,
+            e.severity,
+            e.escalation_potential,
+            e.strategic_impact,
+            e.event_phase,
+            ai.name AS actor_initiator_name,
+            at.name AS actor_target_name,
+            ST_X(e.geom) AS longitude,
+            ST_Y(e.geom) AS latitude
         FROM events e
+        LEFT JOIN actors ai ON ai.id = e.actor_initiator_id
+        LEFT JOIN actors at ON at.id = e.actor_target_id
         WHERE e.id = ANY(%(event_ids)s)
         """,
         {"event_ids": event_ids},
@@ -968,26 +1082,26 @@ def get_event(event_id: int, _: AuthUser = Depends(require_roles("admin", "analy
                         (CASE WHEN current_event.actor_target_id IS NOT NULL AND current_event.actor_target_id IN (related.actor_initiator_id, related.actor_target_id) THEN current_target.name END)
                 ) AS shared(shared_actor_name)
                 WHERE shared_actor_name IS NOT NULL
+                  AND NOT (LOWER(TRIM(shared_actor_name)) = ANY(%(ignored_shared_actor_names)s))
             ) AS shared_actor_names,
             CASE
                 WHEN NULLIF(current_event.city, '') IS NOT NULL
                  AND LOWER(current_event.city) = LOWER(related.city)
                     THEN related.city
                 WHEN NULLIF(COALESCE(current_event.state, current_event.admin1), '') IS NOT NULL
+                 AND (NULLIF(current_event.city, '') IS NULL OR NULLIF(related.city, '') IS NULL)
                  AND LOWER(COALESCE(current_event.state, current_event.admin1)) = LOWER(COALESCE(related.state, related.admin1))
-                 AND LOWER(COALESCE(current_event.country, '')) = LOWER(COALESCE(related.country, ''))
                     THEN COALESCE(related.state, related.admin1)
-                WHEN NULLIF(current_event.country, '') IS NOT NULL
-                 AND LOWER(current_event.country) = LOWER(related.country)
-                    THEN related.country
                 ELSE NULL
             END AS shared_location_name,
             CASE
                 WHEN NULLIF(current_event.weapon_system, '') IS NOT NULL
                  AND LOWER(current_event.weapon_system) = LOWER(related.weapon_system)
+                 AND NOT (LOWER(TRIM(current_event.weapon_system)) = ANY(%(ignored_shared_weapon_names)s))
                     THEN related.weapon_system
                 WHEN NULLIF(current_event.weapon_category, '') IS NOT NULL
                  AND LOWER(current_event.weapon_category) = LOWER(related.weapon_category)
+                 AND NOT (LOWER(TRIM(current_event.weapon_category)) = ANY(%(ignored_shared_weapon_names)s))
                     THEN related.weapon_category
                 ELSE NULL
             END AS shared_weapon,
@@ -1003,7 +1117,7 @@ def get_event(event_id: int, _: AuthUser = Depends(require_roles("admin", "analy
             END AS time_delta_hours,
             CASE
                 WHEN POSITION('factors=' IN COALESCE(el.notes, '')) > 0
-                    THEN string_to_array(split_part(el.notes, 'factors=', 2), ',')
+                    THEN string_to_array(split_part(split_part(el.notes, 'factors=', 2), ';', 1), ',')
                 ELSE ARRAY[]::text[]
             END AS link_factors,
             el.relationship_type,
@@ -1029,7 +1143,11 @@ def get_event(event_id: int, _: AuthUser = Depends(require_roles("admin", "analy
             el.link_confidence DESC NULLS LAST,
             el.created_at DESC
         """,
-        {"event_id": event_id},
+        {
+            "event_id": event_id,
+            "ignored_shared_actor_names": IGNORED_SHARED_ACTOR_NAMES_PARAM,
+            "ignored_shared_weapon_names": IGNORED_SHARED_WEAPON_NAMES_PARAM,
+        },
     )
 
     return EventDetail(**row, sources=sources, proposed_links=proposed_links)
@@ -1225,7 +1343,11 @@ def update_event_link_status(
         UPDATE event_links
         SET
             status = %(status)s,
-            notes = COALESCE(%(notes)s, notes)
+            notes = CASE
+                WHEN NULLIF(%(notes)s, '') IS NULL THEN notes
+                WHEN notes IS NULL OR notes = '' THEN CONCAT('analyst_note=', %(notes)s)
+                ELSE CONCAT(notes, '; analyst_note=', %(notes)s)
+            END
         WHERE id = %(link_id)s
         """,
         {"status": payload.status, "notes": payload.notes, "link_id": link_id},
